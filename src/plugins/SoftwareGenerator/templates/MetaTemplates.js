@@ -1,7 +1,7 @@
 /*globals define*/
 /*
  * Финальная версия генератора YAML для Home Assistant.
- * Корректно обрабатывает внешние и внутренние переходы, а также узлы "Выбор" (Choice).
+ * Корректно обрабатывает круговые ссылки при сохранении модели в JSON.
  */
 define([
     'bower/js-yaml/dist/js-yaml.min', 
@@ -35,23 +35,29 @@ define([
     };
 
     /**
-     * Рекурсивно строит последовательность действий, прослеживая путь через узлы выбора.
-     * @param {object} transition - Текущий переход для обработки.
-     * @param {object} objects - Словарь всех объектов модели.
-     * @param {string} smSnakeName - Имя машины состояний в snake_case.
-     * @param {object} logger - Логгер.
-     * @returns {Array} - Массив действий для Home Assistant.
+     * НОВАЯ ФУНКЦИЯ: Создает "заменитель" для JSON.stringify, который обрабатывает круговые ссылки.
+     * @returns {function} Replacer-функция.
      */
+    const getCircularReplacer = () => {
+        const seen = new WeakSet();
+        return (key, value) => {
+            // Если значение - объект и мы его уже видели, то прерываем цикл.
+            if (typeof value === "object" && value !== null) {
+                if (seen.has(value)) {
+                    return; // Возвращаем undefined, чтобы JSON.stringify пропустил это свойство.
+                }
+                seen.add(value);
+            }
+            return value;
+        };
+    };
+
     function buildActionSequence(transition, objects, smSnakeName, logger) {
+        // ... (эта функция остается без изменений)
         let sequence = [];
         const targetNode = objects[transition.pointers.dst];
-
-        // 1. Добавляем действие самого перехода
         sequence.push(...safeLoadYamlAction(transition.attributes.Action, logger));
-
-        // 2. Проверяем, куда ведет переход
         if (targetNode.type === 'State' || targetNode.type === 'End State') {
-            // Конечная точка: меняем состояние и выполняем entry-действие
             sequence.push({
                 service: 'input_select.select_option',
                 target: { entity_id: `input_select.${smSnakeName}` },
@@ -59,28 +65,22 @@ define([
             });
             sequence.push(...safeLoadYamlAction(targetNode.attributes.Entry, logger));
         } else if (targetNode.type === 'Choice Pseudostate') {
-            // Промежуточная точка: создаем вложенный блок choose
             const outgoingFromChoice = Object.values(objects)
                 .filter(o => o.type === 'External Transition' && o.pointers.src === targetNode.path);
-            
             const defaultBranch = outgoingFromChoice.find(t => !t.attributes.Guard);
             const guardedBranches = outgoingFromChoice.filter(t => t.attributes.Guard);
-
             const innerChoose = {
                 choose: guardedBranches.map(branch => ({
                     conditions: [{
                         condition: 'template',
-                        // Убираем скобки [ ] если они есть (на всякий случай)
                         value_template: `{{ ${branch.attributes.Guard.replace(/^\[|\]$/g, '').trim()} }}`
                     }],
                     sequence: buildActionSequence(branch, objects, smSnakeName, logger)
                 }))
             };
-            
             if (defaultBranch) {
                 innerChoose.default = buildActionSequence(defaultBranch, objects, smSnakeName, logger);
             }
-
             sequence.push(innerChoose);
         }
         return sequence;
@@ -111,67 +111,50 @@ define([
                 initialStateName = toSnakeCase(objects[initialTransition.pointers.dst].sanitizedName);
             }
 
-            // --- Генерация YAML ---
+            // --- Генерация YAML (без изменений) ---
             let haConfig = {};
-
-            // 1. input_select
             haConfig.input_select = {};
-            haConfig.input_select[smSnakeName] = {
-                name: smRoot.sanitizedName,
-                options: states.map(s => toSnakeCase(s.sanitizedName)),
-                initial: initialStateName,
-                icon: 'mdi:state-machine',
-            };
-
-            // 2. automation
+            haConfig.input_select[smSnakeName] = { name: smRoot.sanitizedName, options: states.map(s => toSnakeCase(s.sanitizedName)), initial: initialStateName, icon: 'mdi:state-machine' };
             const mainChoose = [];
-
             for (const state of states) {
-                // Находим все переходы, исходящие из этого состояния
                 const outgoingTransitions = transitions.filter(t => t.pointers.src === state.path);
-                
                 for (const trans of outgoingTransitions) {
                     const eventName = trans.attributes.Event;
-                    if (!eventName) continue; // Пропускаем переходы без события (например, из узла Выбор)
-
-                    const sourceState = state;
+                    if (!eventName) continue;
                     let sequence = [];
-
                     if (trans.type === 'External Transition') {
-                        // Внешний переход: Exit -> Transition Action -> ...
-                        sequence.push(...safeLoadYamlAction(sourceState.attributes.Exit, logger));
+                        sequence.push(...safeLoadYamlAction(state.attributes.Exit, logger));
                         sequence.push(...buildActionSequence(trans, objects, smSnakeName, logger));
-                    } else { // Internal Transition
-                        // Внутренний переход: только действие самого перехода
+                    } else {
                         sequence.push(...safeLoadYamlAction(trans.attributes.Action, logger));
                     }
-
                     mainChoose.push({
                         conditions: [
-                            { condition: 'state', entity_id: inputSelectEntityId, state: toSnakeCase(sourceState.sanitizedName) },
+                            { condition: 'state', entity_id: inputSelectEntityId, state: toSnakeCase(state.sanitizedName) },
                             { condition: 'template', value_template: `{{ trigger.event.data.event == '${eventName}' }}` }
                         ],
                         sequence: sequence
                     });
                 }
             }
-
-            haConfig.automation = [{
-                id: `${smSnakeName}_automation`,
-                alias: `State Machine: ${smRoot.sanitizedName}`,
-                description: `Handles state transitions for ${smRoot.sanitizedName}`,
-                mode: 'single',
-                trigger: [{ platform: 'event', event_type: eventType }],
-                action: [{ choose: mainChoose }]
-            }];
+            haConfig.automation = [{ id: `${smSnakeName}_automation`, alias: `State Machine: ${smRoot.sanitizedName}`, description: `Handles state transitions for ${smRoot.sanitizedName}`, mode: 'single', trigger: [{ platform: 'event', event_type: eventType }], action: [{ choose: mainChoose }] }];
             
-            // --- Создание артефакта ---
+            // --- Создание артефакта YAML ---
             const yamlString = jsyaml.dump(haConfig, { indent: 2, lineWidth: -1, noRefs: true });
             const fileHeader = `#\n# Auto-generated Home Assistant configuration for "${smRoot.sanitizedName}" state machine.\n` +
                              `# Generated by WebGME plugin on ${new Date().toISOString()}\n#\n\n`;
-            const fileName = `${smSnakeName}.yaml`;
-            generatedArtifacts[fileName] = fileHeader + yamlString;
+            const yamlFileName = `${smSnakeName}.yaml`;
+            generatedArtifacts[yamlFileName] = fileHeader + yamlString;
             
+            // --- Сохранение оригинальной модели в JSON с обработкой циклов ---
+            logger.info('Сохранение исходной модели в JSON для отладки...');
+            
+            // ИЗМЕНЕННАЯ СТРОКА: Используем наш новый replacer
+            const jsonModelString = JSON.stringify(model, getCircularReplacer(), 2);
+            
+            const jsonModelFileName = `${smSnakeName}_model.json`;
+            generatedArtifacts[jsonModelFileName] = jsonModelString;
+
             return generatedArtifacts;
         },
 
