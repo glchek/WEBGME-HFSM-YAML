@@ -1,192 +1,220 @@
-define(['bower/handlebars/handlebars.min',
-        './uml/Templates',
-        'text!./test_bench/Makefile.tmpl',
-        'text!./test_bench/test.cpp'],
-       function(handlebars,
-                UMLTemplates,
-                MakefileTempl,
-                MainTestTempl) {
-         'use strict';
+/*globals define*/
+/*
+ * Этот файл содержит логику для преобразования модели конечного автомата WebGME
+ * в конфигурацию YAML для Home Assistant.
+ * Он разработан как прямая замена для генератора C++.
+ */
+define([
+    // ЗАВИСИМОСТЬ: Убедитесь, что библиотека js-yaml доступна в вашем проекте (например, через bower).
+    'bower/js-yaml/dist/js-yaml.min', 
+], function (
+    jsyaml
+) {
+    'use strict';
 
-         var Partials = {
-           MakefileTempl: MakefileTempl,
-           MainTestTempl: MainTestTempl,
-         };
+    /**
+     * Вспомогательная функция для преобразования строк в snake_case,
+     * принятый в Home Assistant (например, "My State" -> "my_state").
+     * @param {string} str - Входная строка.
+     * @returns {string}
+     */
+    var toSnakeCase = function (str) {
+        if (!str) return '';
+        return str.replace(/[\s\W]+/g, '_')
+                  .replace(/([A-Z])/g, '_$1')
+                  .replace(/__+/g, '_')
+                  .replace(/^_|_$/g, '')
+                  .toLowerCase();
+    };
+    
+    /**
+     * Безопасно парсит строку YAML. Возвращает массив действий или null в случае ошибки.
+     * @param {string} yamlString - Строка с YAML-контентом.
+     * @param {object} logger - Логгер WebGME для вывода предупреждений.
+     * @returns {Array|null}
+     */
+    var safeLoadYamlAction = function(yamlString, logger) {
+        if (!yamlString || typeof yamlString !== 'string' || yamlString.trim() === '') {
+            return null;
+        }
+        try {
+            const parsed = jsyaml.load(yamlString);
+            if (Array.isArray(parsed)) return parsed; // Если это уже массив, возвращаем его
+            if (typeof parsed === 'object' && parsed !== null) return [parsed]; // Оборачиваем одиночный объект в массив
+            
+            (logger || console).warn(`Содержимое YAML было разобрано, но не является объектом или массивом: ${yamlString}`);
+            return null;
+        } catch (e) {
+            (logger || console).warn(`Не удалось разобрать строку YAML. Ошибка: ${e.message}. Содержимое: "${yamlString}"`);
+            return null;
+        }
+    };
 
-         Object.keys(Partials).map(function(partialName) {
-           handlebars.registerPartial( partialName, Partials[ partialName ] );
-         });
+    return {
+        /**
+         * Основная функция, генерирующая YAML для Home Assistant.
+         * Имя 'renderHFSM' сохранено для совместимости с SoftwareGenerator.js.
+         * Эта функция полностью заменяет логику генерации C++.
+         *
+         * @param {object} model - Модель проекта WebGME, как она поступает из SoftwareGenerator.js.
+         * @param {string} namespace - (Не используется, но оставлен для совместимости).
+         * @param {function} objToFilePrefixFn - Функция для добавления префикса к имени файла.
+         * @returns {object} - Словарь с артефактами в виде { 'filename.yaml': 'file_content' }.
+         */
+        renderHFSM: function (model, namespace, objToFilePrefixFn) {
+            // 'this' будет содержать logger, если он передан из SoftwareGenerator
+            var logger = this.logger || console;
+            var objects = model.objects;
+            var generatedArtifacts = {};
 
-         return {
-           TestTemplates: {
-             "State Machine": {
-               "Makefile": 'MakefileTempl',
-               "{{{sanitizedName}}}_test.cpp": 'MainTestTempl',
-             },
-           },
-           Templates: {
-           },
-           makeVariableName: function(obj) {
-             var self = this;
-             obj.VariableName = obj.sanitizedName.toUpperCase() + '_OBJ';
-           },
-           makePointerName: function( obj, objDict ) {
-             var self = this;
-             if (obj.pointerName)
-             return;
-             if ( obj.VariableName == undefined )
-             self.makeVariableName( obj );
-             var pName = obj.VariableName;
-             var parent = objDict[ obj.parentPath ];
-             if (parent && obj.type != 'State Machine') {
-               self.makePointerName( parent, objDict );
-               pName = parent.pointerName + '__' + pName;
-             }
-             obj.pointerName = pName;
-           },
-           makeFullyQualifiedVariableName: function( obj, objDict ) {
-             var self = this;
-             if (obj.fullyQualifiedVariableName)
-             return;
-             if ( obj.VariableName == undefined )
-             self.makeVariableName( obj );
-             var fqName = obj.VariableName;
-             var parent = objDict[ obj.parentPath ];
-             if (parent && obj.type != 'State Machine') {
-               self.makeFullyQualifiedVariableName( parent, objDict );
-               fqName = parent.fullyQualifiedVariableName + '.' + fqName;
-             }
-             obj.fullyQualifiedVariableName = fqName;
-           },
-           makeFullyQualifiedName: function( obj, objDict ) {
-             var self = this;
-             if (obj.fullyQualifiedName)
-             return;
-             var fqName = obj.sanitizedName;
-             var parent = objDict[ obj.parentPath ];
-             // make sure we have a relatively unique name for the state
-             if (parent && parent.type != 'State Machine') {
-               self.makeFullyQualifiedName( parent, objDict );
-               fqName = parent.fullyQualifiedName + '::' + fqName;
-             }
-             obj.fullyQualifiedName = fqName;
-           },
-             renderTestCode: function( model, namespace, objToFilePrefixFn ) {
-             var self = this;
-             var objects = model.objects;
-             var root    = model.root;
-             var artifacts = {};
-             Object.keys(objects).map(function (path) {
-               var obj = objects[ path ];
-               obj['namespace'] = namespace;
-               var templDict = self.TestTemplates[ obj.type ];
-               if ( templDict ) {
-                 Object.keys(templDict).map(function(templPath) {
-                   var templName = templDict[ templPath ];
-                   var fileName = handlebars.compile( templPath )( obj );
-                   var fileData = handlebars.compile(
-                     Partials[ templName ]
-                   )(
-                     obj
-                   );
-                   if (objToFilePrefixFn) {
-                     var fileName = null;
-                     var prefix = objToFilePrefixFn( obj );
-                     if (prefix) {
-                       fileName = prefix + fileName;
-                     }
-                   }
-                   if (fileName) {
-                     artifacts[ fileName ] = fileData;
-                   }
-                 });
-               }
-             });
-             return artifacts;
-           },
-           renderHFSM: function(model, namespace, objToFilePrefixFn ) {
-             var self    = this;
-             var objects = model.objects;
-             var root    = model.root;
-             var rootTypes = ['State Machine'];
-             var generatedArtifacts = {};
+            var smRoot = Object.values(objects).find(o => o.type === 'State Machine');
+            if (!smRoot) {
+                logger.warn('Не найдена "State Machine" в модели. Генерация YAML невозможна.');
+                return {};
+            }
 
-             // make variable names and such for objects
-             Object.keys( objects ).map(function( path ) {
-               var obj = model.objects[ path ];
-               obj.parent = model.objects[ obj.parentPath ];
-               if (obj.type == 'Deep History Pseudostate') {
-                 // make rendered names
-                 self.makeFullyQualifiedName( obj, model.objects );
-                 self.makeFullyQualifiedVariableName( obj, model.objects );
-                 self.makePointerName( obj, model.objects );
-               }
-               else if (obj.type == 'Shallow History Pseudostate') {
-                 // make rendered names
-                 self.makeFullyQualifiedName( obj, model.objects );
-                 self.makeFullyQualifiedVariableName( obj, model.objects );
-                 self.makePointerName( obj, model.objects );
-               }
-               else if (obj.type == 'State') {
-                 // make rendered names
-                 self.makeFullyQualifiedName( obj, model.objects );
-                 self.makeFullyQualifiedVariableName( obj, model.objects );
-                 self.makePointerName( obj, model.objects );
-               }
-               else if (obj.type == 'State Machine') {
-                 // make rendered names
-                 self.makeFullyQualifiedName( obj, model.objects );
-                 self.makeFullyQualifiedVariableName( obj, model.objects );
-                 self.makePointerName( obj, model.objects );
-               }
-               else if (obj.type == 'End State') {
-                 // make rendered names
-                 self.makeFullyQualifiedName( obj, model.objects );
-                 self.makeFullyQualifiedVariableName( obj, model.objects );
-                 self.makePointerName( obj, model.objects );
-               }
-             });
+            // --- Сбор и структурирование данных из модели ---
+            var states = [];
+            var transitions = [];
+            var initialStateName = null;
 
-             rootTypes.map(function(rootType) {
-               var rootTypeList = Object.keys(objects).filter(function(k) {
-                 var o = objects[k];
-                 return o.type == rootType;
-               }).map(function(k) {
-                 return objects[k];
-               });
-               if (rootTypeList) {
-                 rootTypeList.map(function(obj) {
-                   obj['namespace'] = namespace;
-                   var hfsmArtifacts = {};
-                   hfsmArtifacts = Object.assign(
-                     hfsmArtifacts,
-                     UMLTemplates.renderStates( obj )
-                   );
-                   hfsmArtifacts = Object.assign(
-                     hfsmArtifacts,
-                     UMLTemplates.renderStatic()
-                   );
-                   if (objToFilePrefixFn) {
-                     var prefixedArtifacts = {};
-                     Object.keys(hfsmArtifacts).map(function(fname) {
-                       var fdata = hfsmArtifacts[fname];
-                       var prefix = objToFilePrefixFn(obj);
-                       if (prefix) {
-                         var prefixedName = prefix + fname;
-                         prefixedArtifacts[prefixedName] = fdata;
-                       }
-                     });
-                     hfsmArtifacts = prefixedArtifacts;
-                   }
+            Object.keys(objects).forEach(path => {
+                var obj = objects[path];
+                obj.id = path; // Сохраняем путь как уникальный ID для связей
 
-                   generatedArtifacts = Object.assign(
-                     generatedArtifacts,
-                     hfsmArtifacts
-                   );
-                 });
-               }
-             });
-             return generatedArtifacts;
-           },
-         };
-       }); // define( [], function() {} );
+                if (obj.type === 'State' || obj.type === 'End State') {
+                    states.push(obj);
+                } else if (obj.type === 'Transition') {
+                    transitions.push(obj);
+                } else if (obj.type === 'Initial') {
+                    var initialTransition = Object.values(objects).find(t => t.type === 'Transition' && t.src === obj.id);
+                    if (initialTransition && objects[initialTransition.dst]) {
+                        initialStateName = toSnakeCase(objects[initialTransition.dst].sanitizedName);
+                    }
+                }
+            });
+
+            if (!initialStateName && states.length > 0) {
+                initialStateName = toSnakeCase(states[0].sanitizedName);
+                logger.warn(`Начальное состояние не определено явно. Установлено первое найденное: "${initialStateName}"`);
+            }
+            
+            // --- Формирование JS-объекта для последующей конвертации в YAML ---
+            var smSnakeName = toSnakeCase(smRoot.sanitizedName);
+            var inputSelectEntityId = `input_select.${smSnakeName}`;
+            var eventType = `${smSnakeName}_event`;
+
+            var haConfig = {};
+
+            // 1. input_select для хранения состояния
+            haConfig.input_select = {};
+            haConfig.input_select[smSnakeName] = {
+                name: smRoot.sanitizedName,
+                options: states.map(s => toSnakeCase(s.sanitizedName)),
+                initial: initialStateName,
+                icon: 'mdi:state-machine',
+            };
+
+            // 2. automation для управления переходами
+            haConfig.automation = [{
+                id: `${smSnakeName}_automation`,
+                alias: `State Machine: ${smRoot.sanitizedName}`,
+                description: `Handles state transitions for ${smRoot.sanitizedName}`,
+                mode: 'single',
+                trigger: [{
+                    platform: 'event',
+                    event_type: eventType,
+                }],
+                action: [{
+                    choose: transitions.map(trans => {
+                        var sourceState = objects[trans.src];
+                        var targetState = objects[trans.dst];
+                        // Используем sanitizedName перехода как имя события
+                        var eventName = trans.sanitizedName;
+
+                        if (!sourceState || !targetState || sourceState.type === 'Initial' || !eventName) {
+                            return null; // Пропускаем некорректные переходы
+                        }
+
+                        // Собираем последовательность действий: exit -> transition -> entry
+                        var sequence = [];
+                        
+                        // Exit Action (из исходного состояния)
+                        const exitActions = safeLoadYamlAction(sourceState.attributes.exitAction, logger);
+                        if (exitActions) sequence.push(...exitActions);
+                        
+                        // Transition Action (самого перехода)
+                        const transitionActions = safeLoadYamlAction(trans.attributes.action, logger);
+                        if (transitionActions) sequence.push(...transitionActions);
+
+                        // Главное действие: смена состояния
+                        sequence.push({
+                            service: 'input_select.select_option',
+                            target: { entity_id: inputSelectEntityId },
+                            data: { option: toSnakeCase(targetState.sanitizedName) },
+                        });
+                        
+                        // Entry Action (в целевое состояние)
+                        const entryActions = safeLoadYamlAction(targetState.attributes.entryAction, logger);
+                        if (entryActions) sequence.push(...entryActions);
+
+                        // Формируем блок 'choose' для автоматизации
+                        var choice = {
+                            conditions: [
+                                { condition: 'state', entity_id: inputSelectEntityId, state: toSnakeCase(sourceState.sanitizedName) },
+                                { condition: 'template', value_template: `{{ trigger.event.data.event == '${eventName}' }}` }
+                            ],
+                            sequence: sequence
+                        };
+
+                        // Добавляем 'guard' (условие) перехода, если он есть в атрибутах
+                        if (trans.attributes.guard) {
+                            choice.conditions.push({
+                                condition: 'template',
+                                value_template: `{{ ${trans.attributes.guard} }}`
+                            });
+                        }
+
+                        return choice;
+                    }).filter(c => c !== null) // Убираем null-значения от пропущенных переходов
+                }]
+            }];
+
+            // --- Конвертация JS-объекта в YAML строку ---
+            var yamlString = jsyaml.dump(haConfig, { indent: 2, lineWidth: -1, noRefs: true });
+
+            var fileHeader = `#\n# Auto-generated Home Assistant configuration for "${smRoot.sanitizedName}" state machine.\n` +
+                             `# Generated by WebGME plugin on ${new Date().toISOString()}\n#\n`+
+                             `# To trigger a transition, fire an event like this:\n` +
+                             `# service: event.fire\n` +
+                             `# data:\n` +
+                             `#   event_type: ${eventType}\n` +
+                             `#   event_data:\n` +
+                             `#     event: "YOUR_EVENT_NAME" (e.g., "${transitions.length > 0 ? transitions[0].sanitizedName : 'some_event'}")\n#\n\n`;
+            
+            yamlString = fileHeader + yamlString;
+
+            // --- Формирование артефакта ---
+            var fileName = `${smSnakeName}.yaml`;
+            if (objToFilePrefixFn) {
+                var prefix = objToFilePrefixFn(smRoot);
+                if (prefix) {
+                    fileName = prefix + fileName;
+                }
+            }
+
+            generatedArtifacts[fileName] = yamlString;
+            return generatedArtifacts;
+        },
+
+        /**
+         * Эта функция больше не нужна для генерации YAML, но оставлена пустой
+         * для совместимости с SoftwareGenerator.js, если он попытается ее вызвать.
+         * @returns {object} - Пустой объект.
+         */
+        renderTestCode: function (model, namespace, objToFilePrefixFn) {
+            (this.logger || console).info('Test code generation is not applicable for Home Assistant YAML target and will be skipped.');
+            return {};
+        }
+    };
+});
