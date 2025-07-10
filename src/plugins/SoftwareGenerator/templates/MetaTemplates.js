@@ -1,7 +1,8 @@
 /*globals define*/
 /*
- * Финальная версия генератора YAML для Home Assistant.
- * Использует обогащенную процессором модель для корректной обработки всех типов переходов.
+ * Финальная, отказоустойчивая версия генератора YAML для Home Assistant.
+ * Написана с использованием "защитного программирования" для предотвращения сбоев
+ * из-за неполных или некорректных данных в модели.
  */
 define([
     'bower/js-yaml/dist/js-yaml.min', 
@@ -20,11 +21,6 @@ define([
                   .toLowerCase();
     };
     
-    // ВАЖНО: Эта функция ожидает, что в полях Action/Entry/Exit будет ВАЛИДНЫЙ YAML.
-    // 'qwerty' - это невалидный YAML. Пример валидного YAML:
-    // service: notify.persistent_notification
-    // data:
-    //   message: "My action was executed!"
     const safeLoadYamlAction = (yamlString, logger) => {
         if (!yamlString || typeof yamlString !== 'string' || yamlString.trim() === '') return [];
         try {
@@ -34,7 +30,7 @@ define([
             (logger || console).warn(`Содержимое YAML было разобрано, но не является объектом/массивом: ${yamlString}`);
             return [];
         } catch (e) {
-            (logger || console).warn(`Не удалось разобрать строку YAML. Ошибка: ${e.message}. Содержимое: "${yamlString}"`);
+            (logger || console).warn(`Не удалось разобрать строку YAML как действие. Ошибка: ${e.message}. Содержимое: "${yamlString}"`);
             return [];
         }
     };
@@ -43,9 +39,7 @@ define([
         const seen = new WeakSet();
         return (key, value) => {
             if (typeof value === "object" && value !== null) {
-                if (seen.has(value)) {
-                    return;
-                }
+                if (seen.has(value)) return;
                 seen.add(value);
             }
             return value;
@@ -57,61 +51,72 @@ define([
         const pathPart = stateNode.path.replace(/\//g, '_');
         return `${namePart}${pathPart}`;
     };
-    
-    // Эта функция больше не нужна в таком виде, так как логика встроена в основной цикл.
-    // Оставляем ее на случай будущего рефакторинга.
-    function buildActionSequence(transition, objects, smSnakeName, logger, stateIdMap) {
+
+    // Рекурсивная функция, переписанная с учетом проверок
+    function buildTransitionSequence(transition, allObjects, smSnakeName, logger, stateIdMap) {
         let sequence = [];
-        const targetNode = objects[transition.dstPath]; // Предполагаем, что dstPath есть
-        sequence.push(...safeLoadYamlAction(transition.attributes.Action, logger));
-        if (targetNode) {
-             if (targetNode.type === 'State' || targetNode.type === 'End State') {
-                sequence.push({
-                    service: 'input_select.select_option',
-                    target: { entity_id: `input_select.${smSnakeName}` },
-                    data: { option: stateIdMap.get(targetNode) }
-                });
+
+        // ЗАЩИТА: Проверяем наличие атрибутов перед использованием
+        if (transition.attributes && transition.attributes.Action) {
+            sequence.push(...safeLoadYamlAction(transition.attributes.Action, logger));
+        }
+
+        // ЗАЩИТА: Проверяем, что у перехода есть указатели и цель
+        if (!transition.pointers || !transition.pointers.dst) {
+            logger.warn(`У перехода по пути ${transition.path} отсутствует указатель на цель (dst).`);
+            return sequence;
+        }
+        
+        const targetNode = allObjects[transition.pointers.dst];
+        if (!targetNode) {
+            logger.warn(`Цель перехода ${transition.pointers.dst} не найдена в модели.`);
+            return sequence;
+        }
+
+        if (targetNode.type === 'State' || targetNode.type === 'End State') {
+            sequence.push({
+                service: 'input_select.select_option',
+                target: { entity_id: `input_select.${smSnakeName}` },
+                data: { option: stateIdMap.get(targetNode) }
+            });
+            if (targetNode.attributes && targetNode.attributes.Entry) {
                 sequence.push(...safeLoadYamlAction(targetNode.attributes.Entry, logger));
             }
-            // Логика для Choice Pseudostate должна быть здесь, если она понадобится
+        } else if (targetNode.type === 'Choice Pseudostate') {
+            const outgoingFromChoice = Object.values(allObjects)
+                .filter(o => o && o.type === 'External Transition' && o.pointers && o.pointers.src === targetNode.path);
+            
+            const defaultBranch = outgoingFromChoice.find(t => t.attributes && !t.attributes.Guard);
+            const guardedBranches = outgoingFromChoice.filter(t => t.attributes && t.attributes.Guard);
+
+            const innerChoose = {
+                choose: guardedBranches.map(branch => ({
+                    conditions: [{
+                        condition: 'template',
+                        value_template: `{{ ${branch.attributes.Guard.replace(/^\[|\]$/g, '').trim()} }}`
+                    }],
+                    sequence: buildTransitionSequence(branch, allObjects, smSnakeName, logger, stateIdMap)
+                }))
+            };
+            
+            if (defaultBranch) {
+                innerChoose.default = buildTransitionSequence(defaultBranch, allObjects, smSnakeName, logger, stateIdMap);
+            }
+
+            sequence.push(innerChoose);
         }
         return sequence;
     }
 
-
     return {
         renderHFSM: function (model, namespace, objToFilePrefixFn) {
             const logger = this.logger || console;
+            const allObjects = model.objects;
             let generatedArtifacts = {};
-            
-            // --- НОВЫЙ ПОДХОД: РАЗБОР ДЕРЕВА МОДЕЛИ ---
-            // Собираем все узлы в плоский словарь для удобного доступа
-            const allObjects = {};
-            function flattenTree(node) {
-                if (!node || !node.path) return;
-                allObjects[node.path] = node;
-                if (node.childPaths) {
-                    node.childPaths.forEach(childPath => {
-                        // Рекурсивно обходим дочерние узлы, которые находятся внутри родителя
-                        const childNode = Object.values(node).find(prop => prop && prop.path === childPath);
-                        if (childNode) {
-                           flattenTree(childNode);
-                        }
-                    });
-                }
-                 // Также обходим списки, которые создает процессор
-                Object.keys(node).forEach(key => {
-                    if (key.endsWith('_list') && Array.isArray(node[key])) {
-                        node[key].forEach(item => flattenTree(item));
-                    }
-                });
-            }
-            flattenTree(model.root);
-            // --- КОНЕЦ НОВОГО ПОДХОДА ---
 
-            const smRoot = model.root;
-            if (!smRoot || smRoot.type !== 'State Machine') {
-                logger.warn('Корень модели не является "State Machine".');
+            const smRoot = Object.values(allObjects).find(o => o && o.type === 'State Machine');
+            if (!smRoot) {
+                logger.error('Не найдена "State Machine" в модели. Прерывание.');
                 return {};
             }
 
@@ -119,16 +124,14 @@ define([
             const inputSelectEntityId = `input_select.${smSnakeName}`;
             const eventType = `${smSnakeName}_event`;
 
-            const states = Object.values(allObjects).filter(o => o.type === 'State' || o.type === 'End State');
+            const states = Object.values(allObjects).filter(o => o && (o.type === 'State' || o.type === 'End State'));
+            const transitions = Object.values(allObjects).filter(o => o && (o.type === 'External Transition' || o.type === 'Internal Transition'));
             
             const stateIdMap = new Map();
-            states.forEach(state => {
-                stateIdMap.set(state, generateUniqueStateId(state));
-            });
-            
+            states.forEach(state => stateIdMap.set(state, generateUniqueStateId(state)));
+
             let initialUniqueStateId = null;
-            // Ищем начальный переход, который теперь точно есть в allObjects
-            const initialTransition = Object.values(allObjects).find(t => t.src && t.src.type === 'Initial');
+            const initialTransition = Object.values(allObjects).find(t => t && t.src && t.src.type === 'Initial');
             if (initialTransition && initialTransition.dst) {
                 initialUniqueStateId = stateIdMap.get(initialTransition.dst);
             }
@@ -143,74 +146,40 @@ define([
             };
             
             const mainChoose = [];
-            // Теперь итерируемся по всем найденным состояниям
             for (const state of states) {
-                // Используем обогащенные процессором списки переходов
-                const externalEvents = state.ExternalEvents || [];
-                const internalEvents = state.InternalEvents || [];
+                // ЗАЩИТА: Проверяем, что у состояния есть путь
+                if (!state || !state.path) continue;
+                
+                // ПРАВИЛЬНЫЙ И БЕЗОПАСНЫЙ ПОИСК ПЕРЕХОДОВ
+                const externalTransitions = transitions.filter(t => t && t.type === 'External Transition' && t.pointers && t.pointers.src === state.path);
+                const internalTransitions = transitions.filter(t => t && t.type === 'Internal Transition' && t.parentPath === state.path);
+                const allStateTransitions = [...externalTransitions, ...internalTransitions];
 
-                const allEvents = [...externalEvents, ...internalEvents];
-
-                for (const event of allEvents) {
-                    if (!event.name || !event.Transitions) continue;
-
-                    for (const trans of event.Transitions) {
-                        if (!trans) continue;
-
-                        let sequence = [];
-
-                        if (trans.isExternalTransition) {
-                             sequence.push(...safeLoadYamlAction(state.attributes.Exit, logger));
-                             sequence.push(...safeLoadYamlAction(trans.attributes.Action, logger));
-
-                            // Обработка цели перехода (включая Choice)
-                            let currentTarget = trans.dst;
-                            if (currentTarget.isChoice) {
-                                const choiceNode = currentTarget;
-                                const guardedBranches = choiceNode.ExternalTransitions.filter(t => t.attributes.Guard);
-                                const defaultBranch = choiceNode.ExternalTransitions.find(t => !t.attributes.Guard);
-                                
-                                const innerChoose = {
-                                    choose: guardedBranches.map(branch => {
-                                        const finalTarget = branch.dst;
-                                        let branchSequence = safeLoadYamlAction(branch.attributes.Action, logger);
-                                        branchSequence.push({ service: 'input_select.select_option', target: { entity_id: inputSelectEntityId }, data: { option: stateIdMap.get(finalTarget) } });
-                                        branchSequence.push(...safeLoadYamlAction(finalTarget.attributes.Entry, logger));
-                                        return {
-                                            conditions: [{ condition: 'template', value_template: `{{ ${branch.attributes.Guard.replace(/^\[|\]$/g, '').trim()} }}` }],
-                                            sequence: branchSequence
-                                        };
-                                    })
-                                };
-
-                                if (defaultBranch) {
-                                    const finalTarget = defaultBranch.dst;
-                                    let defaultSequence = safeLoadYamlAction(defaultBranch.attributes.Action, logger);
-                                    defaultSequence.push({ service: 'input_select.select_option', target: { entity_id: inputSelectEntityId }, data: { option: stateIdMap.get(finalTarget) } });
-                                    defaultSequence.push(...safeLoadYamlAction(finalTarget.attributes.Entry, logger));
-                                    innerChoose.default = defaultSequence;
-                                }
-                                sequence.push(innerChoose);
-
-                            } else {
-                                // Простой переход
-                                sequence.push({ service: 'input_select.select_option', target: { entity_id: inputSelectEntityId }, data: { option: stateIdMap.get(currentTarget) } });
-                                sequence.push(...safeLoadYamlAction(currentTarget.attributes.Entry, logger));
-                            }
-
-                        } else { // Внутренний переход
+                for (const trans of allStateTransitions) {
+                    // ЗАЩИТА: Проверяем, что у перехода есть атрибуты и имя события
+                    const eventName = trans.attributes && trans.attributes.Event;
+                    if (!eventName) continue;
+                    
+                    let sequence = [];
+                    if (trans.type === 'External Transition') {
+                        if (state.attributes && state.attributes.Exit) {
+                            sequence.push(...safeLoadYamlAction(state.attributes.Exit, logger));
+                        }
+                        sequence.push(...buildTransitionSequence(trans, allObjects, smSnakeName, logger, stateIdMap));
+                    } else { // Internal Transition
+                        if (trans.attributes && trans.attributes.Action) {
                             sequence.push(...safeLoadYamlAction(trans.attributes.Action, logger));
                         }
+                    }
 
-                        if(sequence.length > 0) {
-                            mainChoose.push({
-                                conditions: [
-                                    { condition: 'state', entity_id: inputSelectEntityId, state: stateIdMap.get(state) },
-                                    { condition: 'template', value_template: `{{ trigger.event.data.event == '${event.name}' }}` }
-                                ],
-                                sequence: sequence
-                            });
-                        }
+                    if (sequence.length > 0) {
+                        mainChoose.push({
+                            conditions: [
+                                { condition: 'state', entity_id: inputSelectEntityId, state: stateIdMap.get(state) },
+                                { condition: 'template', value_template: `{{ trigger.event.data.event == '${eventName}' }}` }
+                            ],
+                            sequence: sequence
+                        });
                     }
                 }
             }
@@ -219,19 +188,18 @@ define([
             
             const yamlString = jsyaml.dump(haConfig, { indent: 2, lineWidth: -1, noRefs: true });
             const fileHeader = `#\n# Auto-generated Home Assistant configuration for "${smRoot.sanitizedName}" state machine.\n` +
-                             `# Generated by WebGME plugin on ${new Date().toISOString()}\n#\n\n`;
+                             `# Generated by WebGME plugin on ${new Date().toISOString()}\n\n`;
             const yamlFileName = `${smSnakeName}.yaml`;
             generatedArtifacts[yamlFileName] = fileHeader + yamlString;
             
-            logger.info('Сохранение исходной модели в JSON для отладки...');
             const jsonModelString = JSON.stringify(model, getCircularReplacer(), 2);
             const jsonModelFileName = `${smSnakeName}_model.json`;
             generatedArtifacts[jsonModelFileName] = jsonModelString;
 
             return generatedArtifacts;
         },
-
-        renderTestCode: function (model, namespace, objToFilePrefixFn) {
+        
+        renderTestCode: function () {
             return {};
         }
     };
